@@ -9,8 +9,8 @@ let clibgit2: Target = if !localXCFramework.isEmpty {
 } else {
     .binaryTarget(
         name: "CLibGit2",
-        url: "https://example.invalid/CLibGit2.xcframework.zip",
-        checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+        url: "https://github.com/Kaiyou-Digital/KaiyouGit/releases/download/v0.1.0/CLibGit2.xcframework.zip",
+        checksum: "19d44fe31dbd24bcad3e8b707003b303258168327d973be7ecc056854b5373e9"
     )
 }
 
