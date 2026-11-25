@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install lint tools
+        run: |
+          command -v swiftformat > /dev/null || brew install swiftformat
+          command -v swiftlint > /dev/null || brew install swiftlint
+
+      - name: SwiftFormat
+        run: swiftformat --lint .
+
+      - name: SwiftLint
+        run: swiftlint lint --strict
+
+      - name: Notices check
+        run: |
+          Scripts/test-check-notices.sh
+          Scripts/check-notices.sh
+
+      - name: Release scripts self-check
+        run: Scripts/test-release-scripts.sh
+
+      # Key is the hash of the build script, which holds the version pins and every build flag.
+      - name: Cache xcframework
+        id: xcf
+        uses: actions/cache@v4
+        with:
+          path: build/CLibGit2.xcframework
+          key: xcframework-${{ hashFiles('Scripts/build-xcframework.sh') }}
+
+      - name: Build xcframework
+        if: steps.xcf.outputs.cache-hit != 'true'
+        run: OUT_DIR="$PWD/build" Scripts/build-xcframework.sh
+
+      - name: swift test
+        env:
+          KAIYOUGIT_LOCAL_XCFRAMEWORK: build/CLibGit2.xcframework
+        run: swift test
+
+      - name: iOS simulator test
+        uses: ./.github/actions/ios-sim-test
+        env:
+          KAIYOUGIT_LOCAL_XCFRAMEWORK: build/CLibGit2.xcframework

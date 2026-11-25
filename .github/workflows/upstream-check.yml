@@ -1,0 +1,88 @@
+name: Upstream check
+
+on:
+  schedule:
+    - cron: "17 6 3 * *" # the 3rd of each month
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash # bash -eo pipefail
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pins with upstream
+        run: |
+          pin() { sed -n "s/^$1=//p" Scripts/build-xcframework.sh; }
+          # latest <url> <glob> <regex>: highest tag matching the regex (stable X.Y.Z tags only, so no rc, alpha or beta).
+          latest() {
+            git ls-remote --tags --refs "$1" "$2" | sed 's|.*refs/tags/||' | { grep -E "$3" || true; } | sort -V | tail -n 1
+          }
+          rows=""
+          outdated=0
+          # commit <url> <tag>: the commit the tag names (the peeled line for an annotated tag, else the tag's own).
+          commit() {
+            git ls-remote --tags "$1" "refs/tags/$2" "refs/tags/$2^{}" | awk '{ sha = $1 } END { print sha }'
+          }
+          check() { # name pinned latest url
+            [ -n "$3" ] || { echo "No tag found for $1" >&2; exit 1; }
+            if [ "$(printf '%s\n%s\n' "$2" "$3" | sort -V | tail -n 1)" != "$2" ]; then outdated=1; fi
+            rows="$rows| $1 | $2 | $3 | \`$(commit "$4" "$3")\` |"$'\n'
+          }
+          lg2=$(pin LG2_TAG)
+          ssh2=$(pin SSH2_TAG)
+          ossl=$(pin OPENSSL_TAG)
+          check libgit2 "$lg2" "$(latest https://github.com/libgit2/libgit2.git 'v*' '^v[0-9]+\.[0-9]+\.[0-9]+$')" https://github.com/libgit2/libgit2.git
+          check libssh2 "$ssh2" "$(latest https://github.com/libssh2/libssh2.git 'libssh2-*' '^libssh2-[0-9]+\.[0-9]+\.[0-9]+$')" https://github.com/libssh2/libssh2.git
+          # OpenSSL: only the pinned minor line (openssl-3.5 for openssl-3.5.9) can make the pin outdated.
+          line=${ossl%.*}
+          check "OpenSSL ($line.x)" "$ossl" "$(latest https://github.com/openssl/openssl.git "$line.*" "^${line//./\\.}\\.[0-9]+\$")" https://github.com/openssl/openssl.git
+          # Newest stable OpenSSL of any line: information only, never sets outdated.
+          newest_ossl=$(latest https://github.com/openssl/openssl.git 'openssl-*' '^openssl-[0-9]+\.[0-9]+\.[0-9]+$')
+          note=""
+          if [ "${newest_ossl%.*}" != "$line" ]; then
+            note="Newer OpenSSL minor line available (information only; the pinned line is checked above): $newest_ossl."
+          fi
+          printf '%s' "$rows"
+          if [ "$outdated" = 0 ]; then
+            { echo "All pins are current."; if [ -n "$note" ]; then echo; echo "$note"; fi; } | tee -a "$GITHUB_STEP_SUMMARY"
+            for n in $(gh issue list --label upstream-update --state open --json number --jq '.[].number'); do
+              gh issue close "$n" --comment "All pins are current."
+            done
+            exit 0
+          fi
+          {
+            echo "Upstream has newer tags than the pins in Scripts/build-xcframework.sh."
+            echo
+            echo "| Library | Pinned | Latest | Latest commit |"
+            echo "|---|---|---|---|"
+            printf '%s' "$rows"
+            if [ -n "$note" ]; then echo; echo "$note"; fi
+            echo
+            echo "Checklist:"
+            echo
+            echo "- [ ] read the upstream release notes for security fixes"
+            echo "- [ ] bump the tag and the commit pin (the *_SHA lines, the commit in the last column) in Scripts/build-xcframework.sh and the version in THIRD_PARTY_NOTICES.md"
+            echo "- [ ] re-check the key-text matching in Sources/KaiyouGit/Errors.swift (libssh2 sign-in error wording) after a libssh2 bump"
+            echo "- [ ] run CI, then the Release workflow with a dry run"
+          } > issue-body.md
+          cat issue-body.md >> "$GITHUB_STEP_SUMMARY"
+          gh label create upstream-update --color 0e8a16 --description "A pinned upstream library has a newer release" 2> /dev/null || true
+          existing=$(gh issue list --label upstream-update --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file issue-body.md
+            echo "Updated issue #$existing"
+          else
+            gh issue create --label upstream-update --title "Upstream update available for KaiyouGit's bundled libraries" --body-file issue-body.md
+          fi

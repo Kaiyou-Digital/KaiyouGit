@@ -1,0 +1,221 @@
+# Release: run by hand from main, e.g.
+#   gh workflow run release.yml -f version=0.1.0 -f dry_run=false
+# The `build` job (read-only) builds, tests and packages, and uploads the exact bytes as the artifact `release-assets`.
+# The `publish` job (contents: write, not run for a dry run) commits the manifest, tags, pushes both atomically and creates the release.
+#
+# Recovery if `publish` fails, times out or is cancelled: its last step writes the right recipe into the job summary for
+# the state the remote is in. By hand: `Scripts/release-recovery.sh X.Y.Z` (RUN_ID=<the publish run> to fill in the run id).
+# Never rebuild (builds are not byte-reproducible); the recipes reuse the artifact and check it against the tagged manifest.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, X.Y.Z (the tag is vX.Y.Z)
+        required: true
+        type: string
+      dry_run:
+        description: Build, test and show what would be published, but publish nothing
+        required: true
+        type: boolean
+        default: true
+
+# Never two releases at once, and never cancel one half way.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # bash -eo pipefail
+
+env:
+  VERSION: ${{ inputs.version }}
+  DRY_RUN: ${{ inputs.dry_run }}
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      KAIYOUGIT_LOCAL_XCFRAMEWORK: build/CLibGit2.xcframework
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # full history and tags, so the tag check works
+          persist-credentials: false # nothing later in this job pushes; the one step that asks the remote passes the token itself
+
+      - name: Validate version and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "OUT=$RUNNER_TEMP/release-out" >> "$GITHUB_ENV"
+          # The tag check's `git ls-remote` needs the token while the repository is private; only this step has it.
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
+          export GIT_CONFIG_VALUE_0
+          Scripts/check-release-tag.sh "$VERSION"
+          Scripts/check-notices.sh
+          mkdir -p "$RUNNER_TEMP/release-out"
+          git rev-parse HEAD > "$RUNNER_TEMP/release-out/base-sha.txt"
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version | tee -a "$OUT/build-info.txt"
+          swift --version 2>&1 | tee -a "$OUT/build-info.txt"
+
+      # No cache: a release is always built clean.
+      - name: Build xcframework
+        run: |
+          OUT_DIR="$PWD/build" Scripts/build-xcframework.sh
+          { echo; echo "Sources (tag and commit):"; cat build/source-pins.txt; } >> "$OUT/build-info.txt"
+
+      # Everything is tested against the fresh binary before anything is published.
+      - name: swift test
+        run: swift test
+
+      - name: iOS simulator test
+        uses: ./.github/actions/ios-sim-test
+
+      - name: Package
+        run: |
+          checksum=$(Scripts/package-xcframework.sh build)
+          [[ $checksum =~ ^[0-9a-f]{64}$ ]] || { echo "Checksum is not 64 hex digits: $checksum" >&2; exit 1; }
+          echo "$checksum" > "$OUT/checksum.txt"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/CLibGit2.xcframework.zip" > "$OUT/url.txt"
+          stat -f%z build/CLibGit2.xcframework.zip > "$OUT/zip-bytes.txt"
+          cp build/CLibGit2.xcframework.zip THIRD_PARTY_NOTICES.md "$OUT/"
+
+      - name: Rewrite and verify Package.swift
+        run: |
+          Scripts/set-package-binary.sh "$(cat "$OUT/url.txt")" "$(cat "$OUT/checksum.txt")"
+          Scripts/verify-package-rewrite.sh "$(cat "$OUT/url.txt")" "$(cat "$OUT/checksum.txt")"
+          git diff Package.swift > "$OUT/package.diff"
+
+      - name: Release notes
+        run: |
+          pin() { sed -n "s/^$1=//p" Scripts/build-xcframework.sh; }
+          {
+            echo "KaiyouGit $VERSION"
+            echo
+            echo "Pinned source versions (each built at exactly this commit):"
+            echo
+            echo "- libgit2 $(pin LG2_TAG), commit \`$(pin LG2_SHA)\`"
+            echo "- libssh2 $(pin SSH2_TAG), commit \`$(pin SSH2_SHA)\`"
+            echo "- OpenSSL $(pin OPENSSL_TAG), commit \`$(pin OPENSSL_SHA)\`"
+            echo
+            echo "Built with:"
+            echo '```'
+            cat "$OUT/build-info.txt"
+            echo '```'
+            echo
+            echo "Checksum (SHA-256, SwiftPM): \`$(cat "$OUT/checksum.txt")\`"
+            echo
+            echo "The package at tag v$VERSION pins exactly this binary; use \`.package(url:, exact: \"$VERSION\")\`."
+            echo "Licences of the bundled libraries: THIRD_PARTY_NOTICES.md (attached)."
+          } > "$OUT/release-notes.md"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Release $VERSION (dry run: $DRY_RUN)"
+            echo
+            echo "- Checksum: \`$(cat "$OUT/checksum.txt")\`"
+            echo "- Zip size: $(cat "$OUT/zip-bytes.txt") bytes"
+            echo "- Asset URL: $(cat "$OUT/url.txt")"
+            echo "- Built from main at $(cat "$OUT/base-sha.txt")"
+            echo
+            echo "### Package.swift diff"
+            echo '```diff'
+            cat "$OUT/package.diff"
+            echo '```'
+            echo
+            echo "### Release notes"
+            echo
+            cat "$OUT/release-notes.md"
+            echo
+            if [ "$DRY_RUN" = true ]; then
+              echo "Dry run: nothing committed, tagged, pushed or released. A real run would commit \`Release $VERSION [skip ci]\` to main, tag v$VERSION, and publish CLibGit2.xcframework.zip and THIRD_PARTY_NOTICES.md."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-out
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && !inputs.dry_run
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }} # the gh steps below (visibility, release, download, recovery)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # A private repo's release-asset URL cannot be resolved by SwiftPM consumers, so refuse before anything is pushed.
+      - name: Repository must be public
+        run: |
+          visibility=$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility)
+          [ "$visibility" = PUBLIC ] || { echo "Repository visibility is $visibility, not PUBLIC; nothing was pushed" >&2; exit 1; }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-out
+
+      - name: Check that nothing moved since the build
+        run: |
+          echo "OUT=$RUNNER_TEMP/release-out" >> "$GITHUB_ENV"
+          out="$RUNNER_TEMP/release-out"
+          Scripts/check-main-tip.sh "$(cat "$out/base-sha.txt")"
+          Scripts/check-release-tag.sh "$VERSION"
+          url=$(cat "$out/url.txt")
+          sum=$(cat "$out/checksum.txt")
+          [ "$(swift package compute-checksum "$out/CLibGit2.xcframework.zip")" = "$sum" ] || { echo "Artifact zip does not match the build's checksum" >&2; exit 1; }
+          Scripts/set-package-binary.sh "$url" "$sum"
+          Scripts/verify-package-rewrite.sh "$url" "$sum"
+
+      - name: Commit, tag, push (atomic)
+        id: push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Release $VERSION [skip ci]" Package.swift
+          git tag -a "v$VERSION" -m "KaiyouGit $VERSION"
+          # Atomic: if main moved or is protected, neither the commit nor the tag lands.
+          git push --atomic origin HEAD:main "refs/tags/v$VERSION"
+
+      - name: Create GitHub release
+        run: |
+          gh release create "v$VERSION" --verify-tag --title "KaiyouGit $VERSION" --notes-file "$OUT/release-notes.md" \
+            "$OUT/CLibGit2.xcframework.zip" "$OUT/THIRD_PARTY_NOTICES.md"
+
+      - name: Verify the uploaded asset
+        run: |
+          dl=$(mktemp -d)
+          gh release download "v$VERSION" -p CLibGit2.xcframework.zip -D "$dl"
+          got=$(swift package compute-checksum "$dl/CLibGit2.xcframework.zip")
+          want=$(cat "$OUT/checksum.txt")
+          [ "$got" = "$want" ] || { echo "UPLOADED ASSET CHECKSUM $got DIFFERS FROM THE MANIFEST'S $want" >&2; exit 1; }
+
+      # Runs after any failure, timeout or cancel above, and says what to do for the state the remote is actually in.
+      - name: Recovery steps
+        if: ${{ failure() || cancelled() }}
+        run: Scripts/release-recovery.sh "$VERSION" >> "$GITHUB_STEP_SUMMARY" || echo "Could not work out the release state; run Scripts/release-recovery.sh $VERSION by hand" >> "$GITHUB_STEP_SUMMARY"

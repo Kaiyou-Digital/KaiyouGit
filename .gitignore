@@ -1,0 +1,7 @@
+.build/
+*.xcframework
+*.zip
+.superpowers/
+.DS_Store
+*.xcodeproj
+build/

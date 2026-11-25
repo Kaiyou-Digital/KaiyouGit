@@ -1,0 +1,28 @@
+included:
+  - Sources
+  - Tests
+excluded:
+  - .build
+
+disabled_rules:
+  # SwiftFormat owns trailing commas; leaving this on makes the two tools fight.
+  - trailing_comma
+
+line_length:
+  warning: 140
+  error: 200
+  ignores_urls: true
+
+nesting:
+  # Small Decodable or helper types are nested next to the code that uses them.
+  type_level: 2
+
+opening_brace:
+  # SwiftFormat owns brace placement and puts the brace of a multi-line condition on its own line; leaving the strict
+  # rule on makes the two tools fight (as with trailing_comma).
+  ignore_multiline_statement_conditions: true
+  ignore_multiline_type_headers: true
+  ignore_multiline_function_signatures: true
+
+identifier_name:
+  excluded: [id, x, y, fm, ext]
